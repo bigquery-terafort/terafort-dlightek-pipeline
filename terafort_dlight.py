@@ -176,7 +176,8 @@ def authenticate() -> tuple[requests.Session, str]:
 
     # 2. resolve aaaId dynamically
     h = dict(EAG_HEADERS_BASE); h["Access-Token"] = access
-    org = _json_ok(_request(s, "POST", ORG_URL, headers=h, json_body={},
+    org = _json_ok(_request(s, "POST", ORG_URL, headers=h,
+                            json_body={"paging": {"currentPage": 1, "pageSize": 999}},
                             step="getOrg"), "getOrg")
     aaa_id = _first_id(org.get("result"), ("aaaId", "id"), "aaaId")
     print(f"✅ resolved aaaId={aaa_id}")
@@ -189,15 +190,20 @@ def authenticate() -> tuple[requests.Session, str]:
     h["Access-Token"] = access
 
     # 4. resolve businessAccountId dynamically
-    biz = _json_ok(_request(s, "POST", BIZ_URL, headers=h, json_body={},
+    biz = _json_ok(_request(s, "POST", BIZ_URL, headers=h,
+                            json_body={"businessTypes": ["19"],
+                                       "businessAreaTypes": [1],
+                                       "paging": {"currentPage": 1, "pageSize": 999}},
                             step="getBiz"), "getBiz")
     biz_id = _first_id(biz.get("result"), ("businessAccountId", "id"), "businessAccountId")
-    print(f"✅ resolved businessAccountId={biz_id}")
+    biz_aaa_id = _record_field(biz.get("result"), ("aaaId",), default=aaa_id)
+    print(f"✅ resolved businessAccountId={biz_id} (aaaId={biz_aaa_id})")
 
-    # 5. switch business account
+    # 5. switch business account (uses the business record's own aaaId --
+    #    the HAR showed it can differ from the org-level aaaId)
     data = _json_ok(_request(s, "POST", SWITCH_BIZ, headers=h,
                              json_body={"businessAccountId": str(biz_id),
-                                        "aaaId": str(aaa_id)}, step="switchBiz"),
+                                        "aaaId": str(biz_aaa_id)}, step="switchBiz"),
                     "switchBiz")
     access = _require_access_token(data, "switchBiz", prior=access)
     h["Access-Token"] = access
@@ -258,16 +264,35 @@ def _require_access_token(data, step, prior=None):
 
 def _first_id(result, keys, label):
     """Pull the first record's id from a list/dict result, trying several keys."""
-    rows = result
-    if isinstance(result, dict):
-        rows = result.get("list") or result.get("records") or result.get("data") or []
-    if not isinstance(rows, list) or not rows:
-        fail(f"could not resolve {label}: result had no list ({str(result)[:120]})")
-    rec = rows[0]
+    rec = _first_record(result, label)
     for k in keys:
         if isinstance(rec, dict) and rec.get(k) not in (None, ""):
             return rec[k]
-    fail(f"could not find any of {keys} in first record for {label}: {str(rec)[:120]}")
+    fail(f"could not find any of {keys} in first record for {label}: {str(rec)[:160]}")
+
+
+def _record_field(result, keys, default=None):
+    """Best-effort read of a field from the first record; falls back to default."""
+    try:
+        rec = _first_record(result, "field-lookup")
+    except SystemExit:
+        return default
+    for k in keys:
+        if isinstance(rec, dict) and rec.get(k) not in (None, ""):
+            return rec[k]
+    return default
+
+
+def _first_record(result, label):
+    rows = result
+    if isinstance(result, dict):
+        rows = (result.get("list") or result.get("records") or result.get("rows")
+                or result.get("data") or [])
+        if isinstance(rows, dict):
+            rows = (rows.get("list") or rows.get("records") or rows.get("rows") or [])
+    if not isinstance(rows, list) or not rows:
+        fail(f"could not resolve {label}: result had no list ({str(result)[:160]})")
+    return rows[0]
 
 
 # ------------------------------------------------------------ data pull
