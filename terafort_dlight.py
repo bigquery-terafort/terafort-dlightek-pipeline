@@ -208,17 +208,17 @@ def authenticate() -> tuple[requests.Session, str]:
     access = _require_access_token(data, "switchBiz", prior=access)
     h["Access-Token"] = access
 
-    # 6. getAuthCode (mints the bridge access-token)
+    # 6. getAuthCode -- returns a short-lived authCode used by the callback.
+    #    Response may carry it as result.authCode / result.code / result (string)
+    #    AND/OR re-mint an access-token. We capture both.
     data = _json_ok(_request(s, "POST", AUTHCODE_URL, headers=h,
                              json_body={"accessToken": access}, step="getAuthCode"),
                     "getAuthCode")
+    auth_code = _extract_auth_code(data)
     bridge_access = _require_access_token(data, "getAuthCode", prior=access)
 
-    # 6b. establish the dlightek SESSION by consuming the bridge token.
-    #     The browser does this via a loginX-style endpoint (the HAR shows its
-    #     logout counterpart: /api/user/logoutX?token=...&accessToken=...).
-    #     We probe the plausible variants and VERIFY by calling /api/user/profile.
-    _establish_dlight_session(s, bridge_access)
+    # 6b. consume authCode on dlightek's callback -> server sets SESSION cookie.
+    _establish_dlight_session(s, auth_code, bridge_access)
 
     # 7. getAhaGameToken -- SESSION cookie carried automatically by the jar.
     #    Also pass access-token as a belt-and-suspenders header.
@@ -268,56 +268,78 @@ def _require_access_token(data, step, prior=None):
     return tok
 
 
-def _establish_dlight_session(s, bridge_access):
-    """Consume the eagllwin bridge token on dev.dlightek.com so the server
-    issues its SESSION cookie into our jar. The exact endpoint name was not
-    capturable (HAR predated the session), so we probe the plausible variants
-    -- each is a harmless GET -- and VERIFY success via /api/user/profile.
-    Override with env DLIGHT_BRIDGE_URL ( '{T}' placeholder = bridge token )."""
-    ua = {"Accept": "application/json, text/plain, */*",
+CALLBACK_URL = "https://dev.dlightek.com/api/user/callback"
+CALLBACK_PATH = "https://dev.dlightek.com/admin-data-report/apkGameData"
+
+
+def _extract_auth_code(data):
+    """getAuthCode short code -- distinct from the 3-... access-token.
+    Seen as a plain alphanumeric string ending in a timestamp."""
+    r = data.get("result")
+    if isinstance(r, dict):
+        for k in ("authCode", "code", "auth_code", "ticket"):
+            v = r.get(k)
+            if isinstance(v, str) and v and not v.startswith("3-"):
+                return v
+    if isinstance(r, str) and r and not r.startswith("3-"):
+        return r
+    for k in ("authCode", "code"):
+        v = data.get(k)
+        if isinstance(v, str) and v and not v.startswith("3-"):
+            return v
+    return None
+
+
+def _establish_dlight_session(s, auth_code, access_fallback):
+    """Consume the authCode on dlightek's callback so the server issues the
+    SESSION cookie into our jar, then VERIFY via /api/user/profile.
+    Exact endpoint confirmed from capture:
+       GET /api/user/callback?path=...&authCode=...&langType=en&businessType=19
+    (302 -> sets SESSION). We also try the access-token as a fallback code."""
+    ua = {"Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
           "User-Agent": EAG_HEADERS_BASE["User-Agent"],
-          "Referer": "https://dev.dlightek.com/"}
+          "Referer": "https://portal.lionnan.com/"}
+    from urllib.parse import quote
+    codes = [c for c in (auth_code, access_fallback) if c]
     override = os.environ.get("DLIGHT_BRIDGE_URL", "").strip()
-    if override:
-        candidates = [override.replace("{T}", bridge_access)]
-    else:
-        T = bridge_access
-        candidates = [
-            f"https://dev.dlightek.com/api/user/loginX?accessToken={T}",
-            f"https://dev.dlightek.com/api/user/loginX?token=&accessToken={T}",
-            f"https://dev.dlightek.com/api/user/login?accessToken={T}",
-            f"https://dev.dlightek.com/api/user/loginByAccessToken?accessToken={T}",
-            f"https://dev.dlightek.com/?accessToken={T}",
-            f"https://dev.dlightek.com/#/login?accessToken={T}",
-        ]
+
     tried = []
-    for url in candidates:
-        label = url.split("dlightek.com")[1].split("?")[0] or "/"
+    for code in codes:
+        if override:
+            url = override.replace("{CODE}", code).replace("{T}", code)
+        else:
+            url = (f"{CALLBACK_URL}?path={quote(CALLBACK_PATH, safe='')}"
+                   f"&authCode={code}&langType=en&businessType=19")
         try:
             s.get(url, headers=ua, timeout=HTTP_TIMEOUT, allow_redirects=True)
         except requests.RequestException as exc:
-            tried.append(f"{label} -> network error {exc}")
+            tried.append(f"code={code[:12]}.. -> network error {exc}")
             continue
-        # verification probe: does dlightek consider us logged in now?
-        try:
-            p = s.get("https://dev.dlightek.com/api/user/profile", headers=ua,
-                      timeout=HTTP_TIMEOUT)
-            pj = p.json() if p.status_code == 200 else {}
-        except (requests.RequestException, ValueError):
-            tried.append(f"{label} -> profile probe failed")
-            continue
-        res = pj.get("result")
-        if str(pj.get("code")) == "200" and isinstance(res, dict) and res.get("email"):
-            print(f"✅ dlightek SESSION established via {label} "
-                  f"(account: {res.get('email')})")
+        if _verify_dlight_session(s):
+            print(f"✅ dlightek SESSION established via callback "
+                  f"(authCode {code[:10]}..)")
             return
-        tried.append(f"{label} -> profile says not logged in")
-    fail("could not establish dlightek SESSION. Tried: " + "; ".join(tried) +
-         ". -> Capture the real bridge endpoint: fresh incognito login with "
-         "DevTools Network open, search (Ctrl+F in Network) for 'loginX' or "
-         "find the first dev.dlightek.com request whose Response Headers "
-         "contain 'set-cookie: SESSION'. Then set repo secret/env "
-         "DLIGHT_BRIDGE_URL with '{T}' as the token placeholder.")
+        tried.append(f"code={code[:12]}.. -> profile says not logged in")
+    fail("could not establish dlightek SESSION via callback. Tried: "
+         + "; ".join(tried) + ". If the authCode field name changed, set "
+         "DLIGHT_BRIDGE_URL with '{CODE}' as the placeholder.")
+
+
+def _verify_dlight_session(s):
+    ua = {"Accept": "application/json, text/plain, */*",
+          "User-Agent": EAG_HEADERS_BASE["User-Agent"],
+          "Referer": "https://dev.dlightek.com/"}
+    try:
+        p = s.get("https://dev.dlightek.com/api/user/profile", headers=ua,
+                  timeout=HTTP_TIMEOUT)
+        pj = p.json() if p.status_code == 200 else {}
+    except (requests.RequestException, ValueError):
+        return False
+    res = pj.get("result")
+    return str(pj.get("code")) == "200" and isinstance(res, dict) and bool(res.get("email"))
+
+
+
 
 
 def _payload(data):
