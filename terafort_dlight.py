@@ -171,7 +171,7 @@ def authenticate() -> tuple[requests.Session, str]:
             "captchaKey": "", "emailCaptcha": ""}
     data = _json_ok(_request(s, "POST", LOGIN_URL, headers=EAG_HEADERS_BASE,
                              json_body=body, step="login"), "login")
-    access = _extract_access_token(data, "login")
+    access = _require_access_token(data, "login")
     print("✅ login ok")
 
     # 2. resolve aaaId dynamically
@@ -185,7 +185,7 @@ def authenticate() -> tuple[requests.Session, str]:
     data = _json_ok(_request(s, "POST", SWITCH_AAA, headers=h,
                              json_body={"aaaId": str(aaa_id)}, step="switchAaa"),
                     "switchAaa")
-    access = _extract_access_token(data, "switchAaa") or access
+    access = _require_access_token(data, "switchAaa", prior=access)
     h["Access-Token"] = access
 
     # 4. resolve businessAccountId dynamically
@@ -199,14 +199,14 @@ def authenticate() -> tuple[requests.Session, str]:
                              json_body={"businessAccountId": str(biz_id),
                                         "aaaId": str(aaa_id)}, step="switchBiz"),
                     "switchBiz")
-    access = _extract_access_token(data, "switchBiz") or access
+    access = _require_access_token(data, "switchBiz", prior=access)
     h["Access-Token"] = access
 
     # 6. getAuthCode (establishes the bridge; SESSION cookie lands in jar)
     data = _json_ok(_request(s, "POST", AUTHCODE_URL, headers=h,
                              json_body={"accessToken": access}, step="getAuthCode"),
                     "getAuthCode")
-    bridge_access = _extract_access_token(data, "getAuthCode") or access
+    bridge_access = _require_access_token(data, "getAuthCode", prior=access)
 
     # 7. getAhaGameToken -- SESSION cookie carried automatically by the jar.
     #    Also pass access-token as a belt-and-suspenders header.
@@ -225,13 +225,35 @@ def authenticate() -> tuple[requests.Session, str]:
 
 
 def _extract_access_token(data, step):
+    """Find the access-token anywhere in the response. Exhaustive by design:
+    eagllwin wraps it inconsistently across endpoints."""
+    candidates = []
     r = data.get("result")
     if isinstance(r, dict):
-        return r.get("accessToken") or r.get("access_token")
-    if isinstance(r, str) and r.startswith("3-"):
-        return r
-    # some responses put it at top level
-    return data.get("accessToken")
+        candidates += [r.get("accessToken"), r.get("access_token"),
+                       r.get("token"), r.get("accessTokenStr")]
+    elif isinstance(r, str) and r.startswith("3-"):
+        candidates.append(r)
+    d = data.get("data")
+    if isinstance(d, dict):
+        candidates += [d.get("accessToken"), d.get("access_token"), d.get("token")]
+    candidates += [data.get("accessToken"), data.get("access_token"),
+                   data.get("token")]
+    for c in candidates:
+        if isinstance(c, str) and c.startswith("3-"):
+            return c
+    return None
+
+
+def _require_access_token(data, step, prior=None):
+    """Extract or fall back to prior; explicit-fail if we'd otherwise send null."""
+    tok = _extract_access_token(data, step) or prior
+    if not tok:
+        fail(f"[{step}] no access-token in response and no prior token to reuse. "
+             f"Response keys={list(data)}; result type="
+             f"{type(data.get('result')).__name__}. Raw(first 300): "
+             f"{json.dumps(data)[:300]}")
+    return tok
 
 
 def _first_id(result, keys, label):
