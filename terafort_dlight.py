@@ -208,11 +208,17 @@ def authenticate() -> tuple[requests.Session, str]:
     access = _require_access_token(data, "switchBiz", prior=access)
     h["Access-Token"] = access
 
-    # 6. getAuthCode (establishes the bridge; SESSION cookie lands in jar)
+    # 6. getAuthCode (mints the bridge access-token)
     data = _json_ok(_request(s, "POST", AUTHCODE_URL, headers=h,
                              json_body={"accessToken": access}, step="getAuthCode"),
                     "getAuthCode")
     bridge_access = _require_access_token(data, "getAuthCode", prior=access)
+
+    # 6b. establish the dlightek SESSION by consuming the bridge token.
+    #     The browser does this via a loginX-style endpoint (the HAR shows its
+    #     logout counterpart: /api/user/logoutX?token=...&accessToken=...).
+    #     We probe the plausible variants and VERIFY by calling /api/user/profile.
+    _establish_dlight_session(s, bridge_access)
 
     # 7. getAhaGameToken -- SESSION cookie carried automatically by the jar.
     #    Also pass access-token as a belt-and-suspenders header.
@@ -260,6 +266,58 @@ def _require_access_token(data, step, prior=None):
              f"{type(data.get('result')).__name__}. Raw(first 300): "
              f"{json.dumps(data)[:300]}")
     return tok
+
+
+def _establish_dlight_session(s, bridge_access):
+    """Consume the eagllwin bridge token on dev.dlightek.com so the server
+    issues its SESSION cookie into our jar. The exact endpoint name was not
+    capturable (HAR predated the session), so we probe the plausible variants
+    -- each is a harmless GET -- and VERIFY success via /api/user/profile.
+    Override with env DLIGHT_BRIDGE_URL ( '{T}' placeholder = bridge token )."""
+    ua = {"Accept": "application/json, text/plain, */*",
+          "User-Agent": EAG_HEADERS_BASE["User-Agent"],
+          "Referer": "https://dev.dlightek.com/"}
+    override = os.environ.get("DLIGHT_BRIDGE_URL", "").strip()
+    if override:
+        candidates = [override.replace("{T}", bridge_access)]
+    else:
+        T = bridge_access
+        candidates = [
+            f"https://dev.dlightek.com/api/user/loginX?accessToken={T}",
+            f"https://dev.dlightek.com/api/user/loginX?token=&accessToken={T}",
+            f"https://dev.dlightek.com/api/user/login?accessToken={T}",
+            f"https://dev.dlightek.com/api/user/loginByAccessToken?accessToken={T}",
+            f"https://dev.dlightek.com/?accessToken={T}",
+            f"https://dev.dlightek.com/#/login?accessToken={T}",
+        ]
+    tried = []
+    for url in candidates:
+        label = url.split("dlightek.com")[1].split("?")[0] or "/"
+        try:
+            s.get(url, headers=ua, timeout=HTTP_TIMEOUT, allow_redirects=True)
+        except requests.RequestException as exc:
+            tried.append(f"{label} -> network error {exc}")
+            continue
+        # verification probe: does dlightek consider us logged in now?
+        try:
+            p = s.get("https://dev.dlightek.com/api/user/profile", headers=ua,
+                      timeout=HTTP_TIMEOUT)
+            pj = p.json() if p.status_code == 200 else {}
+        except (requests.RequestException, ValueError):
+            tried.append(f"{label} -> profile probe failed")
+            continue
+        res = pj.get("result")
+        if str(pj.get("code")) == "200" and isinstance(res, dict) and res.get("email"):
+            print(f"✅ dlightek SESSION established via {label} "
+                  f"(account: {res.get('email')})")
+            return
+        tried.append(f"{label} -> profile says not logged in")
+    fail("could not establish dlightek SESSION. Tried: " + "; ".join(tried) +
+         ". -> Capture the real bridge endpoint: fresh incognito login with "
+         "DevTools Network open, search (Ctrl+F in Network) for 'loginX' or "
+         "find the first dev.dlightek.com request whose Response Headers "
+         "contain 'set-cookie: SESSION'. Then set repo secret/env "
+         "DLIGHT_BRIDGE_URL with '{T}' as the token placeholder.")
 
 
 def _payload(data):
