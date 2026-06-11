@@ -1,1 +1,99 @@
+# =============================================================================
+# Terafort <- D-Light (Dlightek/Transsion) Apk Game Data -> BigQuery
+# Path MUST be: .github/workflows/terafort_dlight.yml   (plural "workflows"!)
+#
+# Self-authenticating: logs in fresh every run (login-per-run), so there is NO
+# token to babysit and an expired session is impossible by construction.
+#
+# Required repo secrets (Settings -> Secrets and variables -> Actions):
+#   DLIGHT_EMAIL      monetization@terafort.com
+#   DLIGHT_PASSWORD   the plaintext password (script MD5-hashes it at runtime)
+#   GCP_SA_KEY        service account JSON (BigQuery Data Editor + Job User)  [reused from Apero]
+#   BQ_PROJECT        GCP project id                                          [reused from Apero]
+#
+# Modes:
+#   * SCHEDULED daily 08:00 PKT -> rolling 30-day window, both timezones
+#   * MANUAL "full_backfill=true" -> from 2026-01-01 to today (one-time seed)
+# =============================================================================
+name: terafort_dlight_to_bigquery
 
+on:
+  schedule:
+    - cron: "0 3 * * *"          # 03:00 UTC = 08:00 PKT daily
+  workflow_dispatch:
+    inputs:
+      full_backfill:
+        description: "Full backfill from 2026-01-01 to today? (otherwise rolling 30 days)"
+        required: false
+        default: "false"
+        type: choice
+        options: ["false", "true"]
+      backfill_start:
+        description: "Backfill start date (YYYY-MM-DD), used only when full_backfill=true"
+        required: false
+        default: "2026-01-01"
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: dlight-pull            # never two runs at once -> MERGE stays race-free
+  cancel-in-progress: false
+
+jobs:
+  pull-and-load:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30          # backfill across 2 timezones can be many pages
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+
+      - name: Run D-Light -> BigQuery pipeline
+        env:
+          DLIGHT_EMAIL: ${{ secrets.DLIGHT_EMAIL }}
+          DLIGHT_PASSWORD: ${{ secrets.DLIGHT_PASSWORD }}
+          BQ_PROJECT: ${{ secrets.BQ_PROJECT }}
+          BQ_DATASET: dlight
+          BQ_TABLE: dlight_daily
+          BQ_LOCATION: "US"
+          TIMEZONES: "UTC,UTC+5"
+          PAGE_LIMIT: "500"
+          LOOKBACK_DAYS: "30"
+          FULL_BACKFILL: ${{ (inputs.full_backfill == 'true') && '1' || '0' }}
+          BACKFILL_START: ${{ inputs.backfill_start || '2026-01-01' }}
+        run: python terafort_dlight.py
+
+      - name: Verify load (rows per timezone, latest days)
+        env:
+          BQ_PROJECT: ${{ secrets.BQ_PROJECT }}
+        run: |
+          python - <<'EOF'
+          import os
+          from google.cloud import bigquery
+          bq = bigquery.Client(project=os.environ["BQ_PROJECT"])
+          q = f"""
+            SELECT timezone, COUNT(*) rows, COUNT(DISTINCT game_package) games,
+                   MIN(dw_date) first_day, MAX(dw_date) last_day,
+                   ROUND(SUM(earnings_usd),2) earnings
+            FROM `{os.environ["BQ_PROJECT"]}.dlight.dlight_daily`
+            GROUP BY timezone ORDER BY timezone"""
+          for r in bq.query(q).result():
+              print(f"{r.timezone:<6} rows={r.rows:<7} games={r.games:<4} "
+                    f"{r.first_day}..{r.last_day}  earnings=${r.earnings:,.2f}")
+          EOF
