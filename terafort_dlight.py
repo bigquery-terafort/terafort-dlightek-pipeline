@@ -273,20 +273,17 @@ CALLBACK_PATH = "https://dev.dlightek.com/admin-data-report/apkGameData"
 
 
 def _extract_auth_code(data):
-    """getAuthCode short code -- distinct from the 3-... access-token.
-    Seen as a plain alphanumeric string ending in a timestamp."""
-    r = data.get("result")
-    if isinstance(r, dict):
-        for k in ("authCode", "code", "auth_code", "ticket"):
-            v = r.get(k)
-            if isinstance(v, str) and v and not v.startswith("3-"):
-                return v
-    if isinstance(r, str) and r and not r.startswith("3-"):
-        return r
-    for k in ("authCode", "code"):
-        v = data.get(k)
-        if isinstance(v, str) and v and not v.startswith("3-"):
-            return v
+    """getAuthCode short code -- CONFIRMED live shape:
+       {"code":0,"message":null,"data":{"authCode":"uYCxbP17811..."}}
+    Checks the data envelope first, then result, then top level."""
+    for container in (data.get("data"), data.get("result"), data):
+        if isinstance(container, dict):
+            for k in ("authCode", "code", "auth_code", "ticket"):
+                v = container.get(k)
+                if isinstance(v, str) and v and not v.startswith("3-"):
+                    return v
+        elif isinstance(container, str) and container and not container.startswith("3-"):
+            return container
     return None
 
 
