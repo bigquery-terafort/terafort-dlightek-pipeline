@@ -179,7 +179,7 @@ def authenticate() -> tuple[requests.Session, str]:
     org = _json_ok(_request(s, "POST", ORG_URL, headers=h,
                             json_body={"paging": {"currentPage": 1, "pageSize": 999}},
                             step="getOrg"), "getOrg")
-    aaa_id = _first_id(org.get("result"), ("aaaId", "id"), "aaaId")
+    aaa_id = _first_id(_payload(org), ("aaaId", "id"), "aaaId")
     print(f"✅ resolved aaaId={aaa_id}")
 
     # 3. switch AAA
@@ -195,8 +195,8 @@ def authenticate() -> tuple[requests.Session, str]:
                                        "businessAreaTypes": [1],
                                        "paging": {"currentPage": 1, "pageSize": 999}},
                             step="getBiz"), "getBiz")
-    biz_id = _first_id(biz.get("result"), ("businessAccountId", "id"), "businessAccountId")
-    biz_aaa_id = _record_field(biz.get("result"), ("aaaId",), default=aaa_id)
+    biz_id = _first_id(_payload(biz), ("businessAccountId", "id"), "businessAccountId")
+    biz_aaa_id = _record_field(_payload(biz), ("aaaId",), default=aaa_id)
     print(f"✅ resolved businessAccountId={biz_id} (aaaId={biz_aaa_id})")
 
     # 5. switch business account (uses the business record's own aaaId --
@@ -260,6 +260,15 @@ def _require_access_token(data, step, prior=None):
              f"{type(data.get('result')).__name__}. Raw(first 300): "
              f"{json.dumps(data)[:300]}")
     return tok
+
+
+def _payload(data):
+    """eagllwin uses two envelopes: tmc endpoints wrap in 'result',
+    advertiser/query endpoints wrap in 'data'. Accept either."""
+    r = data.get("result")
+    if r is not None:
+        return r
+    return data.get("data")
 
 
 def _first_id(result, keys, label):
