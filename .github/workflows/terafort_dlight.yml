@@ -88,12 +88,12 @@ jobs:
           from google.cloud import bigquery
           bq = bigquery.Client(project=os.environ["BQ_PROJECT"])
           q = f"""
-            SELECT timezone, COUNT(*) rows, COUNT(DISTINCT game_package) games,
+            SELECT timezone, COUNT(*) row_count, COUNT(DISTINCT game_package) games,
                    MIN(dw_date) first_day, MAX(dw_date) last_day,
                    ROUND(SUM(earnings_usd),2) earnings
             FROM `{os.environ["BQ_PROJECT"]}.dlight.dlight_daily`
             GROUP BY timezone ORDER BY timezone"""
           for r in bq.query(q).result():
-              print(f"{r.timezone:<6} rows={r.rows:<7} games={r.games:<4} "
+              print(f"{r.timezone:<6} rows={r.row_count:<7} games={r.games:<4} "
                     f"{r.first_day}..{r.last_day}  earnings=${r.earnings:,.2f}")
           EOF
