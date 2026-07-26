@@ -1,50 +1,44 @@
 #!/usr/bin/env python3
 """
 ================================================================================
- D-LIGHT (Dlightek / Transsion) APK GAME DATA  ->  BIGQUERY
+ D-LIGHT (Dlightek / Transsion) APK GAME DATA  ->  BIGQUERY   ·   v2
 ================================================================================
- Self-authenticating, login-per-run pipeline. No token babysitting: every run
- logs in fresh, so an expired session is impossible by construction.
+ REPO: bigquery-terafort/terafort-dlightek-pipeline
 
- AUTH CHAIN (all replicated in one requests.Session cookie jar):
-   1. POST eagllwin/.../loginByEmailAndPassword   {email, password: MD5(pwd)}
-                                                  -> accessToken
-   2. POST .../getOrganizationAaaListByQuery       -> resolve aaaId (dynamic)
-   3. POST .../switchAaaAccount        {aaaId}     -> refreshed accessToken
-   4. POST .../getBusinessAccountListByQuery       -> resolve businessAccountId
-   5. POST .../switchBusinessAccountById           -> refreshed accessToken
-   6. POST .../getAuthCode             {accessToken}
-   7. GET  dlightek/api/aha/getAhaGameToken (SESSION cookie) -> 24h JWT
-   8. GET  data.ahagamecenter.com/api/adInstallPay/list (header token: JWT)
+ DATA HAAL: ✅ sehatmand. Ye script sab se behtar likhi hui thi —
+   `if not all_norm: fail(...)` guard aur staging+atomic MERGE pehle se the.
+   (Yehi do cheezein baaki 11 scripts mein nahi thin.)
 
- DATA PULL:
-   * Dual timezone: pulls the FULL window once per tz in TIMEZONES (UTC, UTC+5).
-   * Generic pagination: read data.total, loop ceil(total/limit) pages,
-     assert collected == total per timezone, else explicit-fail.
-   * Defensive parsing: handles null / "" / "50.00%" / int / float / object.
+ 🟡 v2 KYUN — PAGINATION TIME-BOMB:
+       aaj ka pull: 858 rows ÷ 2 timezones = 429 rows per tz
+       PAGE_LIMIT (purana default)         = 500
+                                              ────
+                                              sirf 71 rows ki gunjaish
 
- LAND -> BigQuery MERGE on (dw_date, game_package, timezone) so the two tz
- versions coexist and daily re-pulls restate cleanly (never duplicate).
+    Aur bug:
+        if total is None:
+            total = int(block.get("total") or 0)     # API ne total na diya → 0
+        ...
+        if not rows or len(all_rows) >= total or ...:
+            break                                    # 429 >= 0 → TRUE → page 1 pe ruk gaya
+        ...
+        if total and len(all_rows) != total:         # total=0 falsy → check SKIP
+            fail(...)
 
- Bleed-proof rules:
-   * Every API response checked: code, message, result-shape. Expired session
-     ("Account not logged in!") -> explicit-fail (shouldn't happen: we log in
-     fresh, but detected anyway).
-   * Transient 5xx / network -> retry w/ backoff. 4xx -> never retried.
-   * No row dropped silently; no metric silently defaulted.
+    Yani 'total' field gayab ho (ya naam badle) to CHUP-CHAAP sirf pehla page
+    aata aur assertion bhi khamosh rehti.
 
- Required env:
-   DLIGHT_EMAIL, DLIGHT_PASSWORD   credentials (password hashed at runtime)
-   BQ_PROJECT
- Optional env:
-   BQ_DATASET (default dlight)  BQ_TABLE (default dlight_daily)
-   BQ_LOCATION (default US)
-   BACKFILL_START (default 2026-01-01)   first date for the one-time backfill
-   LOOKBACK_DAYS (default 30)            rolling window for normal daily runs
-   FULL_BACKFILL ("1" -> from BACKFILL_START to today; else rolling lookback)
-   PAGE_LIMIT (default 500)             rows per page (generic loop regardless)
-   TIMEZONES (default "UTC,UTC+5")      comma list of accept-timezone values
-   DRY_RUN ("1" -> pull+validate, write local NDJSON only)
+ v2 KE FIX:
+   🛡️ 1. 'total' gayab + rows maujood → foran fail (truncation na chhupe)
+   🛡️ 2. page poora bhara ho to aage barho (total==0 pe bhi sahi bartao)
+   🛡️ 3. assertion ab HAR HAAL mein chalti hai
+   🛡️ 4. PAGE_LIMIT default 500 → 1000 (headroom)
+
+ AUTH CHAIN (sab v1 jaisa):
+   login → getOrg → switchAaa → getBiz → switchBiz → getAuthCode →
+   callback (SESSION cookie) → getAhaGameToken (24h JWT) → adInstallPay/list
+
+ LAND -> BigQuery MERGE on (dw_date, game_package, timezone)
 ================================================================================
 """
 import datetime as dt
@@ -72,7 +66,6 @@ LIST_URL    = "https://data.ahagamecenter.com/api/adInstallPay/list"
 HTTP_TIMEOUT = 60
 PKT = ZoneInfo("Asia/Karachi")
 
-# gateway "costume" headers eagllwin requires on every call
 EAG_HEADERS_BASE = {
     "Accept": "application/json, text/plain, */*",
     "Content-Type": "application/json",
@@ -113,7 +106,8 @@ BQ_LOCATION = env("BQ_LOCATION", "US")
 BACKFILL_START = env("BACKFILL_START", "2026-01-01")
 LOOKBACK_DAYS = int(env("LOOKBACK_DAYS", "30"))
 FULL_BACKFILL = env("FULL_BACKFILL", "0") == "1"
-PAGE_LIMIT = int(env("PAGE_LIMIT", "500"))
+# 🛡️ v2: 500 → 1000. Aaj 429 rows/tz hain — 500 pe sirf 71 rows door.
+PAGE_LIMIT = int(env("PAGE_LIMIT", "1000"))
 TIMEZONES = [t.strip() for t in env("TIMEZONES", "UTC,UTC+5").split(",") if t.strip()]
 
 
@@ -141,7 +135,7 @@ def _request(session, method, url, *, headers, json_body=None, step, retries=4):
         if resp.status_code >= 400:
             fail(f"[{step}] HTTP {resp.status_code}: {resp.text[:300]}")
         return resp
-    fail(f"[{step}] exhausted retries")  # unreachable
+    fail(f"[{step}] exhausted retries")
 
 
 def _json_ok(resp, step):
@@ -151,7 +145,6 @@ def _json_ok(resp, step):
         fail(f"[{step}] non-JSON response: {resp.text[:300]}")
     code = str(data.get("code", ""))
     result = data.get("result")
-    # expired-session signature: result is a bilingual error array
     if isinstance(result, list) and any("not logged in" in str(x).lower()
                                         or "未登录" in str(x) for x in result):
         fail(f"[{step}] session not authenticated (result={result}). "
@@ -162,11 +155,10 @@ def _json_ok(resp, step):
 
 
 # ------------------------------------------------------------ auth chain
-def authenticate() -> tuple[requests.Session, str]:
+def authenticate() -> tuple:
     """Run the full SSO chain; return (session, aha_jwt)."""
     s = requests.Session()
 
-    # 1. login
     body = {"email": EMAIL, "password": md5_upper(PASSWORD),
             "captchaKey": "", "emailCaptcha": ""}
     data = _json_ok(_request(s, "POST", LOGIN_URL, headers=EAG_HEADERS_BASE,
@@ -174,7 +166,6 @@ def authenticate() -> tuple[requests.Session, str]:
     access = _require_access_token(data, "login")
     print("✅ login ok")
 
-    # 2. resolve aaaId dynamically
     h = dict(EAG_HEADERS_BASE); h["Access-Token"] = access
     org = _json_ok(_request(s, "POST", ORG_URL, headers=h,
                             json_body={"paging": {"currentPage": 1, "pageSize": 999}},
@@ -182,14 +173,12 @@ def authenticate() -> tuple[requests.Session, str]:
     aaa_id = _first_id(_payload(org), ("aaaId", "id"), "aaaId")
     print(f"✅ resolved aaaId={aaa_id}")
 
-    # 3. switch AAA
     data = _json_ok(_request(s, "POST", SWITCH_AAA, headers=h,
                              json_body={"aaaId": str(aaa_id)}, step="switchAaa"),
                     "switchAaa")
     access = _require_access_token(data, "switchAaa", prior=access)
     h["Access-Token"] = access
 
-    # 4. resolve businessAccountId dynamically
     biz = _json_ok(_request(s, "POST", BIZ_URL, headers=h,
                             json_body={"businessTypes": ["19"],
                                        "businessAreaTypes": [1],
@@ -199,8 +188,6 @@ def authenticate() -> tuple[requests.Session, str]:
     biz_aaa_id = _record_field(_payload(biz), ("aaaId",), default=aaa_id)
     print(f"✅ resolved businessAccountId={biz_id} (aaaId={biz_aaa_id})")
 
-    # 5. switch business account (uses the business record's own aaaId --
-    #    the HAR showed it can differ from the org-level aaaId)
     data = _json_ok(_request(s, "POST", SWITCH_BIZ, headers=h,
                              json_body={"businessAccountId": str(biz_id),
                                         "aaaId": str(biz_aaa_id)}, step="switchBiz"),
@@ -208,20 +195,14 @@ def authenticate() -> tuple[requests.Session, str]:
     access = _require_access_token(data, "switchBiz", prior=access)
     h["Access-Token"] = access
 
-    # 6. getAuthCode -- returns a short-lived authCode used by the callback.
-    #    Response may carry it as result.authCode / result.code / result (string)
-    #    AND/OR re-mint an access-token. We capture both.
     data = _json_ok(_request(s, "POST", AUTHCODE_URL, headers=h,
                              json_body={"accessToken": access}, step="getAuthCode"),
                     "getAuthCode")
     auth_code = _extract_auth_code(data)
     bridge_access = _require_access_token(data, "getAuthCode", prior=access)
 
-    # 6b. consume authCode on dlightek's callback -> server sets SESSION cookie.
     _establish_dlight_session(s, auth_code, bridge_access)
 
-    # 7. getAhaGameToken -- SESSION cookie carried automatically by the jar.
-    #    Also pass access-token as a belt-and-suspenders header.
     dh = {"Accept": "application/json, text/plain, */*",
           "Access-Token": bridge_access,
           "User-Agent": EAG_HEADERS_BASE["User-Agent"]}
@@ -237,8 +218,6 @@ def authenticate() -> tuple[requests.Session, str]:
 
 
 def _extract_access_token(data, step):
-    """Find the access-token anywhere in the response. Exhaustive by design:
-    eagllwin wraps it inconsistently across endpoints."""
     candidates = []
     r = data.get("result")
     if isinstance(r, dict):
@@ -249,8 +228,7 @@ def _extract_access_token(data, step):
     d = data.get("data")
     if isinstance(d, dict):
         candidates += [d.get("accessToken"), d.get("access_token"), d.get("token")]
-    candidates += [data.get("accessToken"), data.get("access_token"),
-                   data.get("token")]
+    candidates += [data.get("accessToken"), data.get("access_token"), data.get("token")]
     for c in candidates:
         if isinstance(c, str) and c.startswith("3-"):
             return c
@@ -258,7 +236,6 @@ def _extract_access_token(data, step):
 
 
 def _require_access_token(data, step, prior=None):
-    """Extract or fall back to prior; explicit-fail if we'd otherwise send null."""
     tok = _extract_access_token(data, step) or prior
     if not tok:
         fail(f"[{step}] no access-token in response and no prior token to reuse. "
@@ -273,9 +250,6 @@ CALLBACK_PATH = "https://dev.dlightek.com/admin-data-report/apkGameData"
 
 
 def _extract_auth_code(data):
-    """getAuthCode short code -- CONFIRMED live shape:
-       {"code":0,"message":null,"data":{"authCode":"uYCxbP17811..."}}
-    Checks the data envelope first, then result, then top level."""
     for container in (data.get("data"), data.get("result"), data):
         if isinstance(container, dict):
             for k in ("authCode", "code", "auth_code", "ticket"):
@@ -288,11 +262,6 @@ def _extract_auth_code(data):
 
 
 def _establish_dlight_session(s, auth_code, access_fallback):
-    """Consume the authCode on dlightek's callback so the server issues the
-    SESSION cookie into our jar, then VERIFY via /api/user/profile.
-    Exact endpoint confirmed from capture:
-       GET /api/user/callback?path=...&authCode=...&langType=en&businessType=19
-    (302 -> sets SESSION). We also try the access-token as a fallback code."""
     ua = {"Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
           "User-Agent": EAG_HEADERS_BASE["User-Agent"],
           "Referer": "https://portal.lionnan.com/"}
@@ -336,12 +305,7 @@ def _verify_dlight_session(s):
     return str(pj.get("code")) == "200" and isinstance(res, dict) and bool(res.get("email"))
 
 
-
-
-
 def _payload(data):
-    """eagllwin uses two envelopes: tmc endpoints wrap in 'result',
-    advertiser/query endpoints wrap in 'data'. Accept either."""
     r = data.get("result")
     if r is not None:
         return r
@@ -349,7 +313,6 @@ def _payload(data):
 
 
 def _first_id(result, keys, label):
-    """Pull the first record's id from a list/dict result, trying several keys."""
     rec = _first_record(result, label)
     for k in keys:
         if isinstance(rec, dict) and rec.get(k) not in (None, ""):
@@ -358,7 +321,6 @@ def _first_id(result, keys, label):
 
 
 def _record_field(result, keys, default=None):
-    """Best-effort read of a field from the first record; falls back to default."""
     try:
         rec = _first_record(result, "field-lookup")
     except SystemExit:
@@ -382,13 +344,16 @@ def _first_record(result, label):
 
 
 # ------------------------------------------------------------ data pull
-def fetch_all(session, jwt, tz, date_start, date_end) -> list[dict]:
-    """Generic total-driven pagination for one timezone window."""
+def fetch_all(session, jwt, tz, date_start, date_end) -> list:
+    """v2: total gayab ho to CHILLAO; page bhar jaye to aage barho;
+    assertion har haal mein chale.
+    """
     headers = {"token": jwt, "lang": "en", "Accept-Timezone": tz,
                "Accept": "application/json, text/plain, */*",
                "User-Agent": EAG_HEADERS_BASE["User-Agent"]}
     all_rows, page = [], 1
     total = None
+
     while True:
         params = (f"?gameName=&gamePackage=&dwDateStart={date_start}"
                   f"&dwDateEnd={date_end}&sortColumn=&sortType=&page={page}"
@@ -397,17 +362,35 @@ def fetch_all(session, jwt, tz, date_start, date_end) -> list[dict]:
                                  step=f"list[{tz}] p{page}"), f"list[{tz}] p{page}")
         block = data.get("data") or {}
         rows = block.get("list") or []
+
         if total is None:
-            total = int(block.get("total") or 0)
+            raw_total = block.get("total")
+            # 🛡️ FIX: 'total' ka gayab hona CHUP-CHAAP truncation ban jata tha.
+            #    total=0 → `len(all_rows) >= 0` hamesha True → page 1 pe break,
+            #    aur neeche wala assertion bhi `if total` ki wajah se skip.
+            if raw_total is None and rows:
+                fail(f"[{tz}] API response has no 'total' field but returned "
+                     f"{len(rows)} rows — pagination cannot be verified. "
+                     f"Refusing to load a possibly-truncated result. "
+                     f"(API shape changed? keys={list(block)})")
+            total = int(raw_total or 0)
             pages = max(1, math.ceil(total / PAGE_LIMIT)) if total else 1
             print(f"   [{tz}] total={total} -> {pages} page(s) @ limit {PAGE_LIMIT}")
+
         all_rows.extend(rows)
-        if not rows or len(all_rows) >= total or page >= 10000:
+
+        # 🛡️ FIX: total==0 pe bhi sahi bartao — page poora bhara ho to aage barho
+        if (not rows
+                or (total and len(all_rows) >= total)
+                or len(rows) < PAGE_LIMIT
+                or page >= 10000):
             break
         page += 1
-    # bleed-proof: collected count must equal server's declared total
-    if total and len(all_rows) != total:
+
+    # 🛡️ FIX: assertion ab HAR HAAL mein (v1 ka `if total and ...` skip ho jata tha)
+    if len(all_rows) != total:
         fail(f"[{tz}] pagination mismatch: collected {len(all_rows)} != total {total}")
+
     print(f"   [{tz}] collected {len(all_rows)} rows ✅")
     return all_rows
 
@@ -435,13 +418,12 @@ def _int(v):
     return int(f) if f is not None else None
 
 
-def normalize(rows, tz, pulled_at) -> list[dict]:
+def normalize(rows, tz, pulled_at) -> list:
     out = []
     for r in rows:
         pkg = r.get("gamePackage")
         d = r.get("dwDate")
         if not pkg or not d:
-            # never silently drop -- a row without a key is a real problem
             fail(f"row missing gamePackage/dwDate: {str(r)[:160]}")
         out.append({
             "dw_date": str(d)[:10],
@@ -462,7 +444,7 @@ def normalize(rows, tz, pulled_at) -> list[dict]:
             "total_revenue_usd": _num(r.get("totalRevenue")),
             "arpu_ten_thousand": _num(r.get("arpuTenThousand")),
             "avg_duration": _num(r.get("avgDuration")),
-            "window_start": None,  # filled by caller
+            "window_start": None,
             "window_end": None,
             "pulled_at_utc": pulled_at,
         })
@@ -561,7 +543,8 @@ def main():
         d_start = (today - dt.timedelta(days=LOOKBACK_DAYS - 1)).isoformat()
     d_end = today.isoformat()
     print(f"🎯 window {d_start} -> {d_end} | timezones={TIMEZONES} "
-          f"| {'FULL BACKFILL' if FULL_BACKFILL else 'rolling'}")
+          f"| {'FULL BACKFILL' if FULL_BACKFILL else 'rolling'} "
+          f"| PAGE_LIMIT={PAGE_LIMIT}")
 
     session, jwt = authenticate()
 
